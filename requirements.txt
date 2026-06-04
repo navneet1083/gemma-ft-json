@@ -1,0 +1,23 @@
+# Core (always required)
+torch>=2.2
+numpy>=1.24
+pyyaml>=6.0
+pillow>=10.0
+tqdm>=4.66
+matplotlib>=3.7
+
+# Optional: dataset curation from PDFs/scans (import-guarded in code)
+# pymupdf>=1.24
+# pytesseract>=0.3.10
+
+# Optional: LOCAL offline loading of Gemma/SigLIP weights you already have.
+# transformers is NEVER allowed to hit the network (see models/backends.py).
+# transformers>=4.49
+# safetensors>=0.4
+
+# Optional: deployment / dev / notebooks
+# fastapi>=0.110
+# uvicorn>=0.29
+# pytest>=8.0
+# nbformat>=5.9
+# ipykernel>=6.29

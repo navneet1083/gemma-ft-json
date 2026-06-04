@@ -1,0 +1,14 @@
+# ============================================================================
+# configs/deploy.yaml — config for the optional FastAPI inference service.
+# ============================================================================
+server:
+  host: "127.0.0.1"
+  port: 8080
+  max_image_mb: 10
+
+inference:
+  checkpoint_path: "./runs/<RUN_NAME>/best.ckpt"
+  config_snapshot: "./runs/<RUN_NAME>/config.snapshot.yaml"
+  max_new_tokens: 1024
+  do_sample: false          # greedy: sampling amplifies hallucination
+  device: "auto"

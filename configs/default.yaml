@@ -1,0 +1,110 @@
+# ============================================================================
+# configs/default.yaml
+#
+# SINGLE SOURCE OF TRUTH for the whole pipeline. Every path (dataset, weights,
+# logs, checkpoints) and every hyper-parameter comes from this file. Nothing is
+# hard-coded in the .py modules. Copy this file and edit it per experiment.
+#
+# Override any key at runtime, e.g.:
+#   gemma-ft-train --config configs/default.yaml --set training.epochs=10
+#
+# OFFLINE BY DEFAULT: the defaults below (decoder.backend=stub, vision.backend=
+# scratch_vit) run end-to-end with NO weights and NO downloads. To fine-tune the
+# REAL Gemma 3 270M, set decoder.backend=local_gemma and decoder.local_dir to a
+# LOCAL directory that already contains the Gemma weights (never a Hub id).
+# ============================================================================
+
+project:
+  name: "gemma-ft-json"
+  seed: 42
+  device: "auto"          # "mps" | "cuda" | "cpu" | "auto"  (mps > cuda > cpu)
+
+paths:
+  # ---- INPUTS you provide (live OUTSIDE the repo) -------------------------
+  images_dir: "/ABSOLUTE/PATH/TO/images"   # page/table images (png/jpg)
+  json_dir:   "/ABSOLUTE/PATH/TO/json"     # GT JSON, one per image (same stem)
+  pdf_dir:    ""                            # OPTIONAL source PDFs (box grounding)
+  # ---- GENERATED ARTIFACTS (created by the pipeline) ----------------------
+  manifest_dir: "./data/manifests"          # jsonl manifest + train/val split
+  runs_dir:     "./runs"                    # per-run logs, checkpoints, plots
+
+model:
+  # ------------------------------------------------------------------------
+  # Hugging Face restriction: NO weights are ever downloaded. Real Gemma/SigLIP
+  # weights must already be on disk and load in OFFLINE mode from `local_dir`.
+  # If local_dir is empty/missing the component falls back to a pure-PyTorch
+  # from-scratch module so the full pipeline still runs.
+  # ------------------------------------------------------------------------
+  decoder:
+    backend: "stub"        # "stub" (pure-torch, no weights) | "local_gemma" (offline)
+    local_dir: ""          # e.g. "/ABSOLUTE/PATH/TO/gemma-3-270m" when backend=local_gemma
+    hidden_size: 640       # stub fallback width; real Gemma reads its own config.json
+    vocab_size: 262144     # Gemma 3 270M vocab (~256k); stub uses this too
+    max_seq_len: 2048
+    n_structure_tokens: 8  # reserved <table>/<row>/<cell>/<eor> ... tokens
+    n_loc_bins: 0          # >0 adds quantized bbox-coordinate tokens (grounding)
+
+  vision:
+    backend: "scratch_vit" # "scratch_vit" (pure-torch, no download) | "local_siglip" (offline)
+    local_dir: ""          # a LOCAL SigLIP dir if backend=local_siglip
+    image_size: 384        # square side after letterbox resize
+    patch_size: 16
+    embed_dim: 384         # from-scratch ViT width
+    depth: 6               # from-scratch ViT layers
+    num_heads: 6
+    freeze: true           # frozen encoder -> less forgetting + lower memory
+
+  projector:
+    type: "mlp"            # maps vision embed_dim -> decoder hidden_size
+    inner_mult: 4
+    dropout: 0.0
+
+  lora:
+    enabled: true          # LoRA on the (frozen-base) decoder -> mitigates forgetting
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj"]   # used by local_gemma backend
+
+data:
+  prompt: "Extract the table as JSON."      # instruction prepended to every sample
+  max_target_tokens: 1024
+  val_fraction: 0.1
+  require_valid_json: true                   # quality gate: drop unparseable GT
+  use_pymupdf_boxes: false                   # true only for digital PDFs in pdf_dir
+
+dataloader:
+  batch_size: 2            # small: MPS-memory friendly
+  num_workers: 0           # 0 is safest on macOS/MPS
+  pin_memory: false        # no-op / can warn on MPS
+  shuffle_train: true
+
+loss:
+  label_smoothing: 0.0
+  content_token_weight: 1.5   # up-weight value tokens vs JSON scaffolding (faithfulness)
+  grounding_weight: 0.0       # >0 enables the bbox grounding auxiliary loss
+
+optim:
+  name: "adamw"
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0      # NaN / gradient-explosion guard
+  scheduler: "cosine"      # "cosine" | "constant"
+  warmup_steps: 100
+
+training:
+  epochs: 5
+  max_steps: -1            # -1 = full epochs; else cap total optimizer steps
+  grad_accum_steps: 4      # effective batch = batch_size * grad_accum_steps
+  log_every_steps: 10
+  eval_every_steps: 200    # 0 = evaluate once per epoch only
+  save_best_only: true     # store weights ONLY when val loss improves
+  resume: true             # auto-resume from runs_dir/<name>/last.ckpt
+  amp: false               # keep false on MPS for numerical stability
+
+logging:
+  level: "INFO"
+  metrics_filename: "metrics.jsonl"   # notebook 05 reads this to plot live
+  log_filename: "train.log"
