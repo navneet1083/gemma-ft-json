@@ -1,149 +1,167 @@
 # gemma-ft-json
 
-Fine-tune **Gemma 3 270M** (text-only) as the decoder of a small Vision-Language
-Model that reads **table / document images** and emits **structured JSON** — fully
-**offline** (no Hugging Face downloads), modular, config-driven, and MPS-friendly.
+**Offline image-to-JSON table extraction by grafting a from-scratch vision encoder onto Gemma 3 270M.**
 
-```
-image ─▶ letterbox ─▶ vision encoder (frozen) ─▶ projector (trained) ─┐
-prompt ─▶ tokenizer ─▶ embeddings ────────────────────────────────────┤
-                                                                       ▼
-                              concat[soft tokens | text] ─▶ Gemma 270M + LoRA ─▶ JSON
-```
+Gemma 3 270M is a *text-only* language model. It has no vision tower, no image
+processor, and no pathway from pixels to its embedding space. This is the root
+cause of the classic failed experiment: *"I applied LoRA and trained on
+(image, JSON) pairs but the model never learned anything from the image."*
+LoRA only perturbs existing weight matrices — it cannot create a sensory
+modality the model never had. There is literally **no gradient path from the
+pixels to the loss** unless you build one.
 
-See `docs/architecture/ARCHITECTURE.md` for the design and `architecture.svg` for
-the diagram.
+This repository builds that path, fully offline (no Hugging Face downloads),
+sized for a Mac M4 with 48 GB unified memory (MPS backend).
 
 ---
 
-## Why this design (short version)
+## 1. Why the naive LoRA attempt fails (diagnosis)
 
-Gemma 3 270M never saw pixels, so we bolt a **frozen** vision encoder and a small
-**trained projector** onto it (LLaVA-style) and adapt the decoder with **LoRA**.
-The decoder brings a strong structured-text prior + tokenizer; LoRA on a frozen
-base is the main defense against catastrophic forgetting. The loss is next-token
-cross-entropy **shaped for faithful extraction**: prompt/visual positions are
-masked, and content tokens are up-weighted over JSON punctuation. Decoding is
-greedy because sampling amplifies hallucination. Full rationale in the docs.
+1. **No input pathway.** A text-only decoder consumes token ids. An image is
+   not a token id. Pasting base64/pixel values as text destroys spatial
+   structure and explodes sequence length.
+2. **Embedding scale mismatch** (the subtle killer). Gemma multiplies its
+   token embeddings by `sqrt(hidden_size) ≈ 25.3` before the first decoder
+   block. A randomly initialised projection layer emits vectors ~25× too
+   small. The frozen LLM treats them as near-zero noise, attention ignores
+   them, gradients through them are tiny, and "training" silently degenerates
+   into the LLM memorising JSON priors while ignoring the image.
+3. **Frozen tokenizer/vocabulary** means structure tokens (`{`, `"`, `:`)
+   dominate the loss; content cells (the part the model must *read from the
+   image*) are under-weighted.
 
-## The Hugging Face restriction (hard requirement)
+The fixes implemented here, in order: a trainable vision encoder + projector
+(creates the gradient path), **RMS calibration** of the projector output to
+the empirical scale of real Gemma text embeddings (fixes the scale mismatch),
+and a **structure-weighted loss** (punctuation 0.6×, cell content 1.4×).
 
-This package **never downloads** weights. At import it sets `HF_HUB_OFFLINE=1` and
-`TRANSFORMERS_OFFLINE=1`. Two ways to run:
+## 2. Approach (LLaVA-style bridge + Donut-style data, minimised)
 
-1. **Zero assets (default, runs anywhere).** Pure-PyTorch fallbacks:
-   `FromScratchViT`, `TinyStubDecoder`, byte-level `ByteTokenizer`. Great for
-   wiring up the pipeline and the EDA/dataloader/training mechanics.
-2. **Real Gemma/SigLIP, loaded locally.** Put weights you already have on disk and
-   set `model.decoder.backend: local_gemma` + `local_dir`. Loading uses
-   `local_files_only=True`; a missing dir raises `WeightsNotFoundError` instead of
-   fetching anything. Obtain Gemma weights through your own approved/offline channel
-   and place the directory locally — the code only ever *reads* it.
+Informed by the literature: LLaVA showed a small trainable MLP projector can
+bridge a vision encoder into a frozen LLM's embedding space; Donut showed
+OCR-free document→JSON works well when trained on synthetically rendered
+documents with pixel-perfect labels and a "read the document" pre-task.
 
-Verify the guard anytime: `python scripts/verify_offline.py --config configs/default.yaml`.
+We combine both, but replace LLaVA's downloaded CLIP tower (forbidden here)
+with a small from-scratch encoder trained jointly — viable because the domain
+is narrow (rendered tables), not open-world photos.
 
-## Install
-
-```bash
-cd gemma-ft-json
-python -m venv .venv && source .venv/bin/activate
-pip install -e .                 # core
-pip install -e ".[hf]"           # + local transformers loading (Gemma/SigLIP)
-pip install -e ".[curation]"     # + PyMuPDF/Tesseract grounding (optional)
-pip install -e ".[serve,dev]"    # + FastAPI service, pytest, notebooks
+```
+PNG 448×448 ─► TableViT-Lite (~11M, from scratch)
+                conv stem /16 ─► 28×28 patches ─► 6 transformer blocks
+                ─► 2×2 pixel-shuffle merge ─► 196 tokens × 1024-d
+            ─► RMS-calibrated MLP projector ─► 196 "soft visual tokens" (640-d)
+            ─► spliced after [BOS]:  [BOS][196 visual][prompt][JSON target]
+            ─► frozen Gemma 3 270M (+ LoRA r=16 on q/v/o_proj)
+            ─► structure-weighted causal-LM cross-entropy
 ```
 
-Requires Python ≥ 3.10 and PyTorch ≥ 2.2 (Apple-Silicon MPS auto-detected).
+Trainable parameters: vision encoder + projector + LoRA ≈ **15–20M** (~7% of
+total). Checkpoints store *only* these (~50 MB), never the frozen base.
 
-## Configure
+### Three-stage curriculum (set `training.stage` in config)
+| Stage | Task | What it teaches |
+|---|---|---|
+| `read` | transcribe all visible text | grounds the encoder in pixels (Donut's pseudo-OCR) |
+| `linearize` | emit `<row> a | b </row>` markup | row/column geometry, spans |
+| `sft` | emit strict JSON | final target format; LoRA enabled here |
 
-Everything lives in `configs/default.yaml` — dataset paths, model backends, LoRA,
-optimizer, training schedule, logging. Set at least:
+You can also run `sft` directly — the curriculum buys faster convergence and
+better cell-content fidelity, not feasibility.
 
-```yaml
-paths:
-  images_dir: "/abs/path/to/images"
-  json_dir:   "/abs/path/to/json"   # one <stem>.json per <stem>.<img>
-```
+### Synthetic data with pixel-perfect labels
+`data/synthetic_tables.py` renders tables with PIL: merged headers, row
+spans, borderless layouts, zebra striping, currency/percent/date cells,
+varying fonts and rules. Because we render them, the JSON ground truth is
+exact — no OCR noise in the labels. Train on 4 000 / validate on 400 by
+default (config-driven).
 
-Override on the CLI: `--set training.epochs=10 dataloader.batch_size=4`.
-
-## Run
-
-```bash
-# 1) verify offline guard
-python scripts/verify_offline.py --config configs/default.yaml
-# 2) train (build manifest + split + fit). Resumes from runs/<name>/last.ckpt.
-python scripts/train.py --config configs/default.yaml
-# 3) predict on one image with the best checkpoint
-python scripts/predict.py \
-  --snapshot runs/gemma-ft-json/config.snapshot.yaml \
-  --checkpoint runs/gemma-ft-json/best.ckpt \
-  --image /abs/path/to/table.png
-# 4) optional deployment service
-python scripts/serve.py --config configs/deploy.yaml
-```
-
-Run the test suite: `pytest -q` (uses the tiny stub backend; no downloads).
-
-## Notebooks (`notebooks/`)
-
-1. **01_build_dataset** — build `train/val.jsonl` from images+JSON; each curation
-   utility exposed and demoed.
-2. **02_dataloader** — tokenizer, transform, `TableJsonDataset`, padded loaders,
-   batch shapes.
-3. **03_eda** — sample image + JSON, target-length histogram.
-4. **04_train** — descriptive training: train/val split, **resume**, tqdm with
-   loss/lr/grad-norm, JSONL metrics, **save-best-only**, per-epoch checkpoints.
-5. **05_plots** — read `runs/<name>/metrics.jsonl` and plot loss/lr/grad-norm;
-   re-run mid-training for **live** curves.
-6. **06_inference_test** — load `best.ckpt`, pick an image, show predicted JSON.
-
-## Project layout
+## 3. Repository layout
 
 ```
 gemma-ft-json/
-├── configs/            default.yaml (master), deploy.yaml
-├── docs/architecture/  architecture.svg + ARCHITECTURE.md
-├── notebooks/          01..06 (see above)
-├── scripts/            train.py, predict.py, verify_offline.py, serve.py
+├── configs/config.yaml          # every path, hparam, probability — single source of truth
 ├── src/gemma_ft_json/
-│   ├── config.py exceptions.py tokenization.py scripts_entry.py
-│   ├── utils/   device · seed · logging_utils · checks
-│   ├── data/    transforms · build_dataset · dataset · collate
-│   ├── models/  vision_encoder · projector · backends(+LoRA) · losses · vlm
-│   ├── training/ optim · checkpoint · trainer
-│   └── inference/ predictor
-└── tests/              test_smoke.py
+│   ├── exceptions.py            # typed errors (ConfigError, ShapeError, NumericalError, …)
+│   ├── config/loader.py         # validated YAML → dataclasses, rejects unknown keys
+│   ├── utils/                   # device (mps→cuda→cpu), seeding, JSONL metrics, registry
+│   ├── data/                    # synthetic generator, Dataset, dynamic-padding collator
+│   ├── models/
+│   │   ├── vision_encoder.py    # TableViT-Lite (registered "table_vit_lite")
+│   │   ├── projector.py         # RMS-calibrated MLP (registered "rms_mlp")
+│   │   ├── lora.py              # dependency-free LoRA (no peft download)
+│   │   ├── gemma_loader.py      # strictly local_files_only load
+│   │   ├── vlm.py               # GemmaVisionForJSON: fusion, forward, generate
+│   │   └── guards.py            # assert_shape / check_finite used at every boundary
+│   ├── training/                # weighted loss, Trainer (resume, NaN policy), checkpoints
+│   └── inference/predictor.py   # image → {raw_text, json, strictly_valid} + JSON repair
+├── notebooks/  01 build dataset · 02 dataloader · 03 EDA · 04 training
+│               05 live loss plots (tail metrics.jsonl while training) · 06 inference
+├── scripts/    build_dataset.py · train.py (CLI twins of notebooks 01/04)
+└── docs/architecture.svg
 ```
 
-## Training behavior
+**Plug-and-play:** encoders and projectors register themselves in
+`utils/registry.py`; to try a new encoder, add a file, decorate the class,
+and change one YAML string. The collator/dataset/trainer are agnostic to it.
 
-Resume is automatic (`runs/<name>/last.ckpt`). Per step we log loss, LR, and
-grad-norm to console (tqdm) and to `metrics.jsonl`. Validation runs on a cadence
-(`eval_every_steps`, or once per epoch if `0`); `best.ckpt` is written **only when
-val loss improves** (`save_best_only`). Checkpoints store *trainable* params only
-(projector + LoRA) plus optimizer/scheduler/epoch/step — the frozen base reloads
-from its local dir. Gradients are clipped; NaN/Inf is caught at the source.
+## 4. Getting the weights without Hugging Face downloads
 
-## Limitations (be honest)
+The code sets `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` *before*
+importing `transformers` and loads with `local_files_only=True`. Nothing is
+fetched at runtime. Obtain Gemma 3 270M weights once through an allowed
+channel — Kaggle Models ("gemma-3", Transformers format) or ai.google.dev —
+copy the folder (config.json, tokenizer files, *.safetensors) to e.g.
+`~/models/gemma-3-270m`, and point `paths.gemma_model_dir` at it. The
+`transformers` *library* itself is just a pip package (PyPI), which is not a
+model download.
 
-* **270M is small.** Expect strong structure but limited capacity on dense,
-  multi-page, or visually noisy tables; treat the stub-only runs as wiring demos,
-  not accuracy benchmarks.
-* **Byte tokenizer is a fallback.** It runs without assets but is far weaker than
-  the real Gemma tokenizer; use `local_gemma` for real results.
-* **Grounding & RL are scaffolding.** `<loc>` tokens, bbox supervision, and RL with
-  exact-match/TEDS rewards have hooks but are not fully wired end-to-end.
-* **Random split.** `split_manifest` shuffles records; for a true generalization
-  test, split by document source so eval layouts are unseen.
-* **Reference generate is slow.** The backend-agnostic loop recomputes the full
-  sequence per token (no KV cache); use the local HF model's cached `.generate`
-  for production speed.
-* **No schema enforcement by default.** Output is greedy free-form JSON; add
-  schema-constrained decoding / validation for guarantees.
+## 5. Quick start
 
-## License
+```bash
+pip install -e .                       # torch, transformers, pyyaml, pillow, tqdm, matplotlib
+# 1. edit configs/config.yaml → paths.gemma_model_dir
+python scripts/build_dataset.py        # or notebook 01
+jupyter lab notebooks/04_training.ipynb
+# while training, open 05_live_plots.ipynb — it tails logs/metrics.jsonl live
+```
 
-Apache-2.0. You are responsible for complying with the licenses/terms of any model
-weights (e.g. Gemma) you load locally.
+Training behaviour (notebook 04 / `training/trainer.py`):
+train/val split from the manifests, tqdm with loss/lr/grad-norm/skip-count,
+AdamW with **two learning rates** (projector+encoder 1e-3, LoRA 1e-4), warmup
++ cosine schedule, gradient accumulation, `last.pt` every epoch, `best.pt`
+**only when validation loss improves**, full resume (optimizer, scheduler,
+RNG state, counters) via `training.resume_from`.
+
+**Never-crash numerics:** shape assertions at every module boundary; inputs
+sanitised with `nan_to_num`; if a step's loss is non-finite the step is
+*skipped and logged* (not crashed); non-finite grad norm → gradients zeroed
+and logged; CE computed in fp32 even on MPS; gradient clipping at 1.0.
+
+## 6. Limitations (honest ones)
+
+- **Synthetic→real gap.** The model learns rendered tables. Photographed or
+  scanned tables (skew, shadows, camera noise) need an augmentation pass or a
+  real-data fine-tune stage; hooks exist in the generator config.
+- **270M is small.** Expect strong structure fidelity and good cell reading
+  on clean renders, but long tables (>~25 rows) press against
+  `max_seq_len=768` and content accuracy degrades before structure does.
+- **196 visual tokens ≈ 32×32 px per token at 448².** Very dense small-font
+  tables lose legibility; raise `image_size` + tokens at memory cost.
+- **Greedy JSON is not guaranteed valid.** `Predictor` reports
+  `strictly_valid` and applies conservative bracket-balancing repair; a
+  constrained decoder would be the principled upgrade.
+- **MPS quirks.** fp32 by default (bf16 on MPS is op-dependent);
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` is set so unsupported ops fall back to CPU
+  silently (slower, not wrong).
+- **No multi-table pages / nested JSON beyond two header levels** in the
+  current generator — extendable in `synthetic_tables.py`.
+
+## 7. Reusing pieces elsewhere
+
+`TableViTLite`, `RMSCalibratedProjector`, `LoRALinear/inject_lora`, the
+NaN-guarded `Trainer`, and `CheckpointManager` have no cross-dependencies on
+each other beyond tensors in/out — each is importable into another project
+as-is. The fusion trick (`vlm.py:_fuse_embeddings`, splice-after-BOS with
+label re-padding) works for any decoder-only LM that exposes
+`inputs_embeds`.

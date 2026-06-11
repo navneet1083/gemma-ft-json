@@ -1,0 +1,90 @@
+# =============================================================================
+# gemma-ft-json :: single source of truth for ALL paths & hyper-parameters.
+# Every module reads from this file (no hard-coded paths anywhere in code).
+# =============================================================================
+
+paths:
+  # Local Gemma 3 270M directory. MUST already exist on disk.
+  # NO Hugging Face downloads happen anywhere in this codebase
+  # (HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE are force-set in code).
+  # Obtain weights via one of the offline-friendly channels:
+  #   1. Kaggle Models  : kaggle.com/models/google/gemma-3  (kagglehub, not HF hub)
+  #   2. Ollama blob export, or a colleague's copied folder
+  #   3. ai.google.dev direct download of the Transformers-format folder
+  # The folder must contain: config.json, tokenizer.json (or tokenizer.model),
+  # and model.safetensors.
+  gemma_model_dir: "~/models/gemma-3-270m"
+
+  data_root: "./data_store"
+  raw_images_dir: "./data_store/raw"
+  processed_dir: "./data_store/processed"
+  manifest_train: "./data_store/processed/train_manifest.jsonl"
+  manifest_val: "./data_store/processed/val_manifest.jsonl"
+  checkpoints_dir: "./checkpoints"
+  logs_dir: "./logs"
+  log_file: "./logs/training.log"        # human-readable log
+  metrics_file: "./logs/metrics.jsonl"   # machine-readable, tailed by plot notebook
+
+device:
+  preferred: "auto"         # auto resolves: mps -> cuda -> cpu (M4 picks MPS)
+  dtype: "float32"          # float32 | bfloat16 (float32 = most numerically stable)
+  mps_fallback_env: true    # PYTORCH_ENABLE_MPS_FALLBACK=1 for unsupported ops
+
+dataset:
+  num_train_samples: 4000
+  num_val_samples: 400
+  image_size: 448           # rendered + model input resolution (AR-preserving pad)
+  min_rows: 2
+  max_rows: 9
+  min_cols: 2
+  max_cols: 6
+  p_merged_header: 0.35     # multi-level (merged) column headers
+  p_row_span: 0.20          # vertically merged cells
+  p_no_gridlines: 0.25      # borderless tables (hard mode)
+  p_zebra: 0.30             # zebra striping
+  seed: 1337
+
+model:
+  vision:                   # from-scratch TableViT-Lite (NO pretrained downloads)
+    embed_dim: 256
+    depth: 6
+    num_heads: 4
+    patch_stride: 16        # 448/16 = 28x28 = 784 patches
+    merge_factor: 2         # pixel-shuffle 2x2 merge -> 14x14 = 196 visual tokens
+    drop_rate: 0.0
+  projector:
+    hidden_mult: 2          # MLP hidden = mult * gemma_hidden
+    rms_calibrate: true     # scale outputs to Gemma text-embedding RMS (critical!)
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "o_proj"]
+  max_seq_len: 768          # visual(196) + prompt + JSON target
+
+training:
+  stage: "sft"              # "align" = projector+vision only (READ/LINEARIZE targets)
+                            # "sft"   = LoRA + projector + vision (JSON targets)
+  epochs: 10
+  batch_size: 4
+  grad_accum_steps: 4       # effective batch = 16
+  lr_projector: 1.0e-3      # random-init modules learn fast
+  lr_lora: 1.0e-4           # LoRA learns slow (protect pretrained knowledge)
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  scheduler: "cosine"
+  grad_clip_norm: 1.0       # hard guard against exploding grads -> NaN
+  label_smoothing: 0.0
+  structure_loss_weight: 0.6   # JSON punctuation tokens weighted DOWN
+  content_loss_weight: 1.4     # cell-content tokens weighted UP
+  val_every_epochs: 1
+  log_every_steps: 10
+  save_best_only: true
+  resume_from: null
+  num_workers: 2
+  seed: 1337
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.0          # greedy -> deterministic JSON
+  json_guard: true          # bracket-balance + auto-repair of truncated JSON

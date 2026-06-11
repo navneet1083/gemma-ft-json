@@ -1,148 +1,123 @@
-"""Vision encoders.
+"""TableViT-Lite: a from-scratch vision encoder biased toward documents.
 
-Two backends behind one factory:
+WHY from scratch?  The "no Hugging Face downloads" constraint removes
+CLIP/SigLIP. Donut showed an encoder can learn to read documents when
+pretrained on *synthetic* renders — and tables are a far narrower visual
+domain than natural images (binary-ish colors, axis-aligned strokes, text
+glyphs), so a small encoder (~11M params) trained on our synthetic corpus
+is sufficient and fits comfortably in 48 GB unified memory next to Gemma.
 
-* `FromScratchViT` — a compact, dependency-free ViT in plain PyTorch. Downloads
-  NOTHING. Random-init runs the pipeline; `load_local_weights` loads a local .pt.
-  (A ViT is the right *architecture*; ideally you want contrastive,
-  aspect-ratio-preserving pretraining — but with no local checkpoint, a
-  from-scratch ViT trained on your corpus is the zero-download fallback.)
-
-* `LocalSiglipEncoder` — wraps a SigLIP/ViT loaded OFFLINE from a local dir.
-
-Both return patch embeddings [B, num_patches, embed_dim].
+Architecture (input 448x448):
+    Conv stem  : 4 stride-2 convs  -> [B, D, 28, 28]   (stride 16 total)
+                 (convs > naive patchify for thin gridlines / small glyphs:
+                  overlapping receptive fields preserve stroke continuity)
+    + learned 2-D positional embedding (tables are intrinsically 2-D; row/col
+      position IS the structure signal)
+    Transformer: `depth` pre-norm blocks over the 784 tokens
+    PixelShuffle merge 2x2 -> 196 tokens of dim 4*D
+        (downsamples the SEQUENCE, not the information: 4 neighbours are
+         concatenated channel-wise, then the projector mixes them. 196 visual
+         tokens keep Gemma's quadratic attention affordable on MPS.)
+Output: [B, 196, 4*embed_dim]  -> consumed by the projector.
 """
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from ..exceptions import WeightsNotFoundError
-from ..utils.checks import check_shape, assert_finite
+from ..utils.registry import Registry
+from .guards import assert_shape, check_finite
 
-
-class _MHSA(nn.Module):
-    """Multi-head self-attention (bidirectional; encoders are not causal).
-
-    MATRIX-MULTIPLY NOTES (requested explicitly):
-      * qkv: x[B,N,D] @ Wqkv[D,3D] -> [B,N,3D]
-      * scores: q[B,h,N,d] @ k^T[B,h,d,N] -> [B,h,N,N], scaled by 1/sqrt(d)
-      * context: softmax(scores)[B,h,N,N] @ v[B,h,N,d] -> [B,h,N,d]
-    """
-
-    def __init__(self, dim: int, num_heads: int):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"embed_dim {dim} not divisible by num_heads {num_heads}")
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, D = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-
-        def split(t):  # [B,N,D] -> [B, heads, N, head_dim]
-            return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q, k, v = split(q), split(k), split(v)
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B,h,N,N]
-        attn = attn.softmax(dim=-1)
-        ctx = attn @ v                                  # [B,h,N,d]
-        ctx = ctx.transpose(1, 2).contiguous().view(B, N, D)
-        return self.proj(ctx)
+VISION_ENCODERS = Registry("vision_encoder")
 
 
 class _Block(nn.Module):
-    """Pre-norm transformer block: x + attn(norm(x)); x + mlp(norm(x))."""
+    """Standard pre-norm transformer block (LN -> MHSA -> LN -> MLP).
 
-    def __init__(self, dim: int, num_heads: int, mlp_mult: int = 4):
+    Pre-norm (LayerNorm BEFORE the sublayer) is chosen over post-norm because
+    it keeps gradient magnitudes bounded in from-scratch training — the
+    single most effective architectural NaN preventative.
+    """
+
+    def __init__(self, dim: int, heads: int, drop: float):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = _MHSA(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, dim * mlp_mult), nn.GELU(),
-                                 nn.Linear(dim * mlp_mult, dim))
+        self.n1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
+        self.n2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(dim * 4, dim), nn.Dropout(drop))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        # MHSA internally computes softmax(Q @ K^T / sqrt(d)) @ V :
+        #   Q,K,V: [B, T, dim] -> attention matrix [B, heads, T, T] -> ctx [B, T, dim]
+        h = self.n1(x)
+        x = x + self.attn(h, h, h, need_weights=False)[0]
+        x = x + self.mlp(self.n2(x))
         return x
 
 
-class FromScratchViT(nn.Module):
-    def __init__(self, image_size=384, patch_size=16, embed_dim=384, depth=6, num_heads=6):
+@VISION_ENCODERS.register("table_vit_lite")
+class TableViTLite(nn.Module):
+    def __init__(self, image_size: int = 448, embed_dim: int = 256, depth: int = 6,
+                 num_heads: int = 4, patch_stride: int = 16, merge_factor: int = 2,
+                 drop_rate: float = 0.0):
         super().__init__()
-        if image_size % patch_size != 0:
-            raise ValueError("image_size must be divisible by patch_size")
-        self.embed_dim = embed_dim
-        self.num_patches = (image_size // patch_size) ** 2
-        # Strided conv == non-overlapping linear patchify.
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        self.blocks = nn.ModuleList([_Block(embed_dim, num_heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(embed_dim)
+        if image_size % patch_stride:
+            raise ValueError("image_size must be divisible by patch_stride")
+        self.grid = image_size // patch_stride            # 28
+        if self.grid % merge_factor:
+            raise ValueError("grid must be divisible by merge_factor")
+        self.merge = merge_factor
+        self.out_grid = self.grid // merge_factor         # 14
+        self.num_tokens = self.out_grid ** 2              # 196
+        self.out_dim = embed_dim * merge_factor ** 2      # 1024
+
+        d = embed_dim
+        # Overlapping conv stem: 3 -> d/8 -> d/4 -> d/2 -> d, total stride 16.
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, d // 8, 5, 2, 2), nn.GELU(),
+            nn.Conv2d(d // 8, d // 4, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(d // 4, d // 2, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(d // 2, d, 3, 2, 1),
+        )
+        # Learned 2-D positional embedding, one vector per stem cell.
+        self.pos = nn.Parameter(torch.zeros(1, self.grid * self.grid, d))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.blocks = nn.ModuleList(
+            [_Block(d, num_heads, drop_rate) for _ in range(depth)])
+        self.norm = nn.LayerNorm(d)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m: nn.Module) -> None:
+        # Small-std init keeps early activations ~N(0, .02) -> no fp blowups.
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        check_shape(pixel_values, (None, 3, None, None), "vit_input")
-        x = self.patch_embed(pixel_values)        # [B, D, H/ps, W/ps]
-        x = x.flatten(2).transpose(1, 2)          # [B, num_patches, D]
-        check_shape(x, (None, self.num_patches, self.embed_dim), "vit_patches")
-        x = x + self.pos_embed                    # broadcast add positions
+        assert_shape(pixel_values, (None, 3, None, None), "pixel_values")
+        x = self.stem(pixel_values)                       # [B, D, 28, 28]
+        B, D, H, W = x.shape
+        if H != self.grid or W != self.grid:
+            # Loud failure beats a silent positional-embedding misalignment.
+            raise RuntimeError(f"stem grid {H}x{W} != expected {self.grid}")
+        x = x.flatten(2).transpose(1, 2)                  # [B, 784, D]
+        x = x + self.pos                                  # broadcast add
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        assert_finite(x, "vit_output")
+        x = check_finite(x, "vision_tokens", sanitize=True)
+
+        # ---- pixel-shuffle token merge: [B, 28*28, D] -> [B, 14*14, 4D] ----
+        m, g = self.merge, self.grid
+        x = x.view(B, g, g, D)
+        x = x.view(B, g // m, m, g // m, m, D)            # split into m x m cells
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()      # group the 4 neighbours
+        x = x.view(B, self.num_tokens, D * m * m)         # concat channel-wise
+        assert_shape(x, (B, self.num_tokens, self.out_dim), "merged_vision_tokens")
         return x
-
-    def load_local_weights(self, path: str | Path) -> None:
-        """Load a LOCAL state_dict (.pt). No network access."""
-        path = Path(path)
-        if not path.is_file():
-            raise WeightsNotFoundError(f"Local ViT weights not found: {path}")
-        self.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
-
-
-class LocalSiglipEncoder(nn.Module):
-    """Offline wrapper around a local SigLIP/ViT (transformers) vision tower."""
-
-    def __init__(self, local_dir: str):
-        super().__init__()
-        try:
-            from transformers import AutoModel
-        except Exception as e:  # noqa: BLE001
-            raise WeightsNotFoundError(
-                "transformers required for local_siglip backend (`pip install -e '.[hf]'`)."
-            ) from e
-        import os
-        if not local_dir or not os.path.isdir(local_dir):
-            raise WeightsNotFoundError(f"Local SigLIP dir not found: '{local_dir}'")
-        self.model = AutoModel.from_pretrained(local_dir, local_files_only=True)
-        cfg = self.model.config
-        self.embed_dim = getattr(cfg, "hidden_size", None) or cfg.vision_config.hidden_size
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        feats = self.model(pixel_values=pixel_values).last_hidden_state  # [B, N(+1), D]
-        assert_finite(feats, "siglip_output")
-        return feats
-
-
-def build_vision_encoder(vision_cfg) -> nn.Module:
-    """Factory selecting the vision backend from config."""
-    if vision_cfg.backend == "local_siglip":
-        enc = LocalSiglipEncoder(vision_cfg.local_dir)
-    else:
-        enc = FromScratchViT(image_size=vision_cfg.image_size, patch_size=vision_cfg.patch_size,
-                             embed_dim=vision_cfg.embed_dim, depth=vision_cfg.depth,
-                             num_heads=vision_cfg.num_heads)
-    if vision_cfg.freeze:
-        for p in enc.parameters():
-            p.requires_grad_(False)
-        enc.eval()
-    return enc

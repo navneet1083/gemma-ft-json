@@ -1,39 +1,34 @@
 """Custom exception hierarchy.
 
-A small, specific exception tree lets callers catch exactly what they expect and
-makes logs self-explanatory. Every module raises one of these rather than a bare
-`Exception`.
+Every layer of the codebase raises *typed* exceptions instead of bare
+``Exception`` so that callers (notebooks, scripts, future services) can
+catch precisely what they can handle and let the rest propagate.
 """
-from __future__ import annotations
 
 
 class GemmaFTError(Exception):
-    """Base class for all errors raised by this package."""
+    """Base class for every error raised by this package."""
 
 
 class ConfigError(GemmaFTError):
-    """Invalid/missing configuration or config file."""
+    """Raised when the YAML config is missing/invalid or a path is wrong."""
 
 
-class DataError(GemmaFTError):
-    """Problem building, reading, or validating the dataset/manifest."""
+class ModelLoadError(GemmaFTError):
+    """Raised when local Gemma weights/tokenizer cannot be loaded offline."""
 
 
-class WeightsNotFoundError(GemmaFTError):
-    """A required LOCAL weights directory/file is missing.
-
-    Raised INSTEAD of silently downloading from Hugging Face (forbidden).
-    """
-
-
-class ShapeMismatchError(GemmaFTError):
-    """A tensor had an unexpected shape; raised by the dimension guards so a bad
-    wiring fails loudly *before* it produces NaNs deep inside training."""
+class ShapeError(GemmaFTError):
+    """Raised by dimension guards when a tensor has an unexpected shape."""
 
 
 class NumericalError(GemmaFTError):
-    """NaN/Inf detected in a tensor (activations, loss, or gradients)."""
+    """Raised when NaN/Inf are detected in activations, loss or gradients."""
+
+
+class DataError(GemmaFTError):
+    """Raised for missing/corrupt dataset files or malformed manifests."""
 
 
 class CheckpointError(GemmaFTError):
-    """Failure while saving/loading a training checkpoint."""
+    """Raised when checkpoint save/load/resume fails."""

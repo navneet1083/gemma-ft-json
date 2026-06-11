@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 920" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#444"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="920" fill="#fafaf7"/>
+  <text x="640" y="38" text-anchor="middle" font-size="24" font-weight="bold" fill="#222">gemma-ft-json — Image → JSON via a from-scratch vision bridge into frozen Gemma 3 270M</text>
+  <text x="640" y="60" text-anchor="middle" font-size="13" fill="#666">fully offline · MPS (Mac M4 48GB) · trainable params ≈ 15–20M (vision + projector + LoRA) · base LLM frozen</text>
+
+  <!-- DATA column -->
+  <rect x="30" y="90" width="270" height="290" rx="10" fill="#eef6ee" stroke="#5a9a5a"/>
+  <text x="165" y="115" text-anchor="middle" font-size="15" font-weight="bold" fill="#2e6b2e">1 · SYNTHETIC DATA ENGINE</text>
+  <text x="45" y="140" font-size="12" fill="#333">data/synthetic_tables.py</text>
+  <rect x="45" y="150" width="240" height="92" rx="6" fill="#fff" stroke="#9c9"/>
+  <text x="55" y="168" font-size="11" fill="#333">PIL-rendered tables, pixel-perfect labels:</text>
+  <text x="55" y="184" font-size="11" fill="#333">• merged headers, row spans, borderless</text>
+  <text x="55" y="200" font-size="11" fill="#333">• zebra rows, currency/%/date cells</text>
+  <text x="55" y="216" font-size="11" fill="#333">• 4000 train / 400 val (config.yaml)</text>
+  <text x="55" y="232" font-size="11" fill="#333">• PNG 448×448 + JSONL manifest</text>
+  <rect x="45" y="252" width="240" height="112" rx="6" fill="#fff" stroke="#9c9"/>
+  <text x="55" y="270" font-size="11" font-weight="bold" fill="#2e6b2e">3-stage curriculum (training.stage)</text>
+  <text x="55" y="288" font-size="11" fill="#333">read → transcribe all text (pseudo-OCR)</text>
+  <text x="55" y="304" font-size="11" fill="#333">linearize → &lt;row&gt; a | b &lt;/row&gt; geometry</text>
+  <text x="55" y="320" font-size="11" fill="#333">sft → strict JSON (LoRA enabled here)</text>
+  <text x="55" y="344" font-size="10" fill="#777">Donut-style grounding before format task</text>
+
+  <!-- VISION column -->
+  <rect x="340" y="90" width="280" height="290" rx="10" fill="#eef1f8" stroke="#5a6e9a"/>
+  <text x="480" y="115" text-anchor="middle" font-size="15" font-weight="bold" fill="#2e4370">2 · TableViT-Lite (TRAINABLE)</text>
+  <text x="355" y="140" font-size="12" fill="#333">models/vision_encoder.py · ~11M params</text>
+  <rect x="355" y="150" width="250" height="46" rx="6" fill="#fff" stroke="#99b"/>
+  <text x="365" y="168" font-size="11" fill="#333">conv stem stride 16 → [B, 784, 256]</text>
+  <text x="365" y="184" font-size="11" fill="#333">(28×28 grid) + learned 2-D pos-embed</text>
+  <rect x="355" y="204" width="250" height="46" rx="6" fill="#fff" stroke="#99b"/>
+  <text x="365" y="222" font-size="11" fill="#333">6 pre-norm transformer blocks, 4 heads</text>
+  <text x="365" y="238" font-size="11" fill="#333">attention = QKᵀ/√d (matmul, commented)</text>
+  <rect x="355" y="258" width="250" height="46" rx="6" fill="#fff" stroke="#99b"/>
+  <text x="365" y="276" font-size="11" fill="#333">2×2 pixel-shuffle merge → [B, 196, 1024]</text>
+  <text x="365" y="292" font-size="11" fill="#333">4× fewer tokens, no information loss</text>
+  <text x="355" y="324" font-size="11" fill="#555">guards.py: assert_shape + check_finite</text>
+  <text x="355" y="340" font-size="11" fill="#555">at every module boundary (nan_to_num)</text>
+  <text x="355" y="364" font-size="10" fill="#777">From scratch — no CLIP download needed;</text>
+  <text x="355" y="378" font-size="10" fill="#777">viable because the domain is narrow.</text>
+
+  <!-- PROJECTOR column -->
+  <rect x="660" y="90" width="280" height="290" rx="10" fill="#fdf3e7" stroke="#c08a3e"/>
+  <text x="800" y="115" text-anchor="middle" font-size="15" font-weight="bold" fill="#8a5a17">3 · RMS-CALIBRATED PROJECTOR</text>
+  <text x="675" y="140" font-size="12" fill="#333">models/projector.py (TRAINABLE)</text>
+  <rect x="675" y="150" width="250" height="62" rx="6" fill="#fff" stroke="#dcb"/>
+  <text x="685" y="168" font-size="11" fill="#333">Linear 1024→1280 → GELU →</text>
+  <text x="685" y="184" font-size="11" fill="#333">Linear 1280→640 → LayerNorm → ×gain</text>
+  <text x="685" y="200" font-size="11" fill="#333">output: 196 soft visual tokens, 640-d</text>
+  <rect x="675" y="220" width="250" height="120" rx="6" fill="#fff" stroke="#c08a3e" stroke-width="2"/>
+  <text x="685" y="240" font-size="11" font-weight="bold" fill="#8a5a17">WHY the naive LoRA attempt failed:</text>
+  <text x="685" y="258" font-size="11" fill="#333">Gemma scales token embeddings by</text>
+  <text x="685" y="274" font-size="11" fill="#333">√hidden ≈ 25.3. A random projector is</text>
+  <text x="685" y="290" font-size="11" fill="#333">~25× too quiet → attention ignores it.</text>
+  <text x="685" y="308" font-size="11" fill="#333">Fix: calibrate() measures empirical RMS</text>
+  <text x="685" y="324" font-size="11" fill="#333">of real text embeddings, matches scale.</text>
+  <text x="675" y="364" font-size="10" fill="#777">LLaVA-style bridge, scale-corrected.</text>
+
+  <!-- LLM column -->
+  <rect x="980" y="90" width="270" height="290" rx="10" fill="#f6eef6" stroke="#8a5a9a"/>
+  <text x="1115" y="115" text-anchor="middle" font-size="15" font-weight="bold" fill="#5e2e70">4 · GEMMA 3 270M (FROZEN)</text>
+  <text x="995" y="140" font-size="12" fill="#333">models/gemma_loader.py · vlm.py</text>
+  <rect x="995" y="150" width="240" height="58" rx="6" fill="#fff" stroke="#caa"/>
+  <text x="1005" y="168" font-size="11" fill="#333">HF_HUB_OFFLINE=1 before import,</text>
+  <text x="1005" y="184" font-size="11" fill="#333">local_files_only=True — zero downloads.</text>
+  <text x="1005" y="200" font-size="11" fill="#333">Weights from Kaggle / ai.google.dev.</text>
+  <rect x="995" y="216" width="240" height="58" rx="6" fill="#fff" stroke="#caa"/>
+  <text x="1005" y="234" font-size="11" font-weight="bold" fill="#5e2e70">LoRA r=16 α=32 on q/v/o_proj</text>
+  <text x="1005" y="250" font-size="11" fill="#333">dependency-free (models/lora.py),</text>
+  <text x="1005" y="266" font-size="11" fill="#333">W + (α/r)·B·A, B zero-init (matmul)</text>
+  <rect x="995" y="282" width="240" height="58" rx="6" fill="#fff" stroke="#caa"/>
+  <text x="1005" y="300" font-size="11" font-weight="bold" fill="#5e2e70">Fusion (vlm.py):</text>
+  <text x="1005" y="316" font-size="11" fill="#333">[BOS][196 visual][prompt][target]</text>
+  <text x="1005" y="332" font-size="11" fill="#333">via inputs_embeds; labels re-padded</text>
+  <text x="995" y="364" font-size="10" fill="#777">Checkpoints save trainables only (~50MB)</text>
+
+  <!-- arrows top row -->
+  <line x1="300" y1="235" x2="340" y2="235" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="620" y1="235" x2="660" y2="235" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="940" y1="235" x2="980" y2="235" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- LOSS box -->
+  <rect x="340" y="420" width="600" height="120" rx="10" fill="#fdeeee" stroke="#b05050"/>
+  <text x="640" y="445" text-anchor="middle" font-size="15" font-weight="bold" fill="#7a2727">5 · STRUCTURE-WEIGHTED CAUSAL-LM LOSS · training/losses.py</text>
+  <text x="360" y="470" font-size="11" fill="#333">logits[:, :-1] vs labels[:, 1:] (causal shift) → cross-entropy in fp32 (MPS-safe) → per-token weights:</text>
+  <text x="360" y="488" font-size="11" fill="#333">JSON punctuation {  }  "  :  , → 0.6× · cell content → 1.4× (forces reading the image, not memorising syntax)</text>
+  <text x="360" y="506" font-size="11" fill="#333">prompt + visual block masked with −100 · raises NumericalError if non-finite → Trainer skips &amp; logs the step</text>
+  <text x="360" y="524" font-size="11" fill="#555">matmuls commented in-code: logitsᵀ·onehot equivalent CE, LoRA BA, attention QKᵀV, projector Linears</text>
+  <line x1="1115" y1="380" x2="1115" y2="480" stroke="#444" stroke-width="2"/>
+  <line x1="1115" y1="480" x2="940" y2="480" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- TRAINER box -->
+  <rect x="30" y="580" width="600" height="300" rx="10" fill="#eef6f6" stroke="#3e8a8a"/>
+  <text x="330" y="605" text-anchor="middle" font-size="15" font-weight="bold" fill="#1f5e5e">6 · TRAINER · training/trainer.py + checkpoint.py</text>
+  <text x="50" y="632" font-size="11" fill="#333">• AdamW with two LRs: projector+encoder 1e-3, LoRA 1e-4 (param_groups in vlm.py)</text>
+  <text x="50" y="652" font-size="11" fill="#333">• warmup + cosine schedule · gradient accumulation 4 · clip-grad-norm 1.0</text>
+  <text x="50" y="672" font-size="11" fill="#333">• tqdm postfix: loss / lr / grad-norm / skipped-steps</text>
+  <text x="50" y="692" font-size="11" font-weight="bold" fill="#1f5e5e">Never-crash NaN policy:</text>
+  <text x="50" y="712" font-size="11" fill="#333">non-finite loss → skip step, log event · non-finite grad-norm → zero grads, skip, log</text>
+  <text x="50" y="732" font-size="11" fill="#333">inputs sanitised (nan_to_num) · every layer boundary shape-asserted</text>
+  <text x="50" y="760" font-size="11" font-weight="bold" fill="#1f5e5e">Checkpointing (CheckpointManager):</text>
+  <text x="50" y="780" font-size="11" fill="#333">last.pt every epoch · best.pt ONLY if val loss improves (save_best_only)</text>
+  <text x="50" y="800" font-size="11" fill="#333">full resume: optimizer, scheduler, RNG state, step/epoch counters (training.resume_from)</text>
+  <text x="50" y="828" font-size="11" font-weight="bold" fill="#1f5e5e">Dual logging:</text>
+  <text x="50" y="848" font-size="11" fill="#333">logs/training.log (human) + logs/metrics.jsonl (machine, line-flushed)</text>
+  <text x="50" y="866" font-size="11" fill="#333">events: run_config, train_step, skip, val, epoch</text>
+
+  <!-- NOTEBOOKS box -->
+  <rect x="660" y="580" width="590" height="300" rx="10" fill="#f4f4ec" stroke="#9a9a3e"/>
+  <text x="955" y="605" text-anchor="middle" font-size="15" font-weight="bold" fill="#6b6b1f">7 · NOTEBOOKS &amp; LIVE MONITORING</text>
+  <text x="680" y="632" font-size="11" fill="#333">01_build_dataset — exposed generator utilities, renders corpus + manifests</text>
+  <text x="680" y="652" font-size="11" fill="#333">02_dataloader — Dataset + VLMCollator, batch shapes inspected</text>
+  <text x="680" y="672" font-size="11" fill="#333">03_eda — visualise images, JSON depth/row/col stats, token-length histograms</text>
+  <text x="680" y="692" font-size="11" fill="#333">04_training — descriptive training, train/val split, resume, tqdm</text>
+  <text x="680" y="712" font-size="11" font-weight="bold" fill="#6b6b1f">05_live_plots — tails logs/metrics.jsonl WHILE 04 is running:</text>
+  <text x="680" y="732" font-size="11" fill="#333">train/val loss curves, lr schedule, grad-norm, skip events (matplotlib)</text>
+  <text x="680" y="752" font-size="11" fill="#333">06_inference_test — upload an image, load best.pt, Predictor →</text>
+  <text x="680" y="772" font-size="11" fill="#333">{raw_text, json, strictly_valid} with bracket-balance JSON repair</text>
+  <text x="680" y="800" font-size="11" font-weight="bold" fill="#6b6b1f">Plug-and-play:</text>
+  <text x="680" y="820" font-size="11" fill="#333">utils/registry.py — encoders/projectors register by name; swap via one</text>
+  <text x="680" y="838" font-size="11" fill="#333">YAML string. All paths/hparams come from configs/config.yaml only.</text>
+  <text x="680" y="864" font-size="11" fill="#555">device: auto → mps → cuda → cpu · fp32 on MPS · MPS fallback enabled</text>
+
+  <line x1="640" y1="540" x2="640" y2="565" stroke="#444" stroke-width="2"/>
+  <line x1="640" y1="565" x2="330" y2="580" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="640" y1="565" x2="955" y2="580" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+</svg>

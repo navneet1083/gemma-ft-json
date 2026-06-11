@@ -1,65 +1,77 @@
-"""Checkpointing.
+"""Checkpointing with best-only retention + full resume support.
 
-Saves a single dict with model/optimizer/scheduler state + run bookkeeping
-(epoch, global_step, best_val). Writes are ATOMIC (temp file then os.replace) so an
-interrupted save can never corrupt an existing checkpoint.
-
-By default we save only TRAINABLE tensors (`save_trainable_only=True`): for the
-offline Gemma the multi-GB base is reloaded from its local dir, so we avoid
-duplicating it; only the projector + LoRA adapters are checkpointed.
+Files written under `checkpoints_dir`:
+    last.pt  — every epoch (enables resume after crash/interrupt)
+    best.pt  — ONLY when val loss improves (project requirement: "storing
+               model weights only if it is learning / better than previous")
+Each file contains trainable weights + optimizer + scheduler + RNG + counters.
 """
 from __future__ import annotations
 
-import os
-import tempfile
+import random
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 
 from ..exceptions import CheckpointError
 
 
-def _trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    train_names = {n for n, p in model.named_parameters() if p.requires_grad}
-    return {k: v for k, v in model.state_dict().items() if k in train_names}
+class CheckpointManager:
+    def __init__(self, ckpt_dir: str, save_best_only: bool = True):
+        self.dir = Path(ckpt_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.save_best_only = save_best_only
+        self.best_val = float("inf")
 
-
-def save_checkpoint(path: str | Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-                    scheduler: Any, epoch: int, global_step: int, best_val: float,
-                    save_trainable_only: bool = True) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        model_state = _trainable_state_dict(model) if save_trainable_only else model.state_dict()
-        payload = {
-            "model": model_state,
-            "trainable_only": save_trainable_only,
+    def _payload(self, model, optimizer, scheduler, epoch: int,
+                 global_step: int) -> Dict[str, Any]:
+        return {
+            "model": model.trainable_state_dict(),
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "epoch": epoch, "global_step": global_step, "best_val": best_val,
+            "scheduler": scheduler.state_dict() if scheduler else None,
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val": self.best_val,
+            "rng": {"py": random.getstate(), "np": np.random.get_state(),
+                    "torch": torch.get_rng_state()},
         }
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        os.close(fd)
-        torch.save(payload, tmp)
-        os.replace(tmp, path)  # atomic on POSIX
-    except OSError as e:
-        raise CheckpointError(f"Failed to save checkpoint {path}: {e}") from e
 
+    def save_epoch(self, model, optimizer, scheduler, epoch: int,
+                   global_step: int, val_loss: Optional[float]) -> Dict[str, bool]:
+        """Always refresh last.pt; refresh best.pt iff val improved."""
+        improved = val_loss is not None and val_loss < self.best_val
+        if improved:
+            self.best_val = float(val_loss)
+        try:
+            payload = self._payload(model, optimizer, scheduler, epoch, global_step)
+            torch.save(payload, self.dir / "last.pt")
+            if improved or not self.save_best_only:
+                torch.save(payload, self.dir / "best.pt")
+        except Exception as exc:
+            raise CheckpointError(f"Saving checkpoint failed: {exc}") from exc
+        return {"saved_best": improved}
 
-def load_checkpoint(path: str | Path, model: torch.nn.Module,
-                    optimizer: Optional[torch.optim.Optimizer] = None, scheduler: Any = None,
-                    map_location: str = "cpu") -> Dict[str, Any]:
-    path = Path(path)
-    if not path.is_file():
-        raise CheckpointError(f"Checkpoint not found: {path}")
-    payload = torch.load(path, map_location=map_location)
-    # strict=False: we may have saved trainable params only.
-    missing, unexpected = model.load_state_dict(payload["model"], strict=False)
-    if optimizer is not None and payload.get("optimizer") is not None:
-        optimizer.load_state_dict(payload["optimizer"])
-    if scheduler is not None and payload.get("scheduler") is not None:
-        scheduler.load_state_dict(payload["scheduler"])
-    return {"epoch": payload.get("epoch", 0), "global_step": payload.get("global_step", 0),
-            "best_val": payload.get("best_val", float("inf")),
-            "missing": missing, "unexpected": unexpected}
+    def resume(self, path: str, model, optimizer=None, scheduler=None) -> Dict[str, Any]:
+        p = Path(path)
+        if not p.exists():
+            raise CheckpointError(f"Resume checkpoint not found: {p}")
+        try:
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            model.load_trainable_state_dict(ck["model"])
+            if optimizer is not None and ck.get("optimizer"):
+                optimizer.load_state_dict(ck["optimizer"])
+            if scheduler is not None and ck.get("scheduler"):
+                scheduler.load_state_dict(ck["scheduler"])
+            self.best_val = ck.get("best_val", float("inf"))
+            rng = ck.get("rng")
+            if rng:
+                random.setstate(rng["py"]); np.random.set_state(rng["np"])
+                torch.set_rng_state(rng["torch"].cpu())
+        except CheckpointError:
+            raise
+        except Exception as exc:
+            raise CheckpointError(f"Resume from {p} failed: {exc}") from exc
+        return {"epoch": ck["epoch"], "global_step": ck["global_step"],
+                "best_val": self.best_val}

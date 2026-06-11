@@ -1,43 +1,27 @@
-# ----------------------------------------------------------------------------
-# pyproject.toml  — PIP-standard packaging metadata (PEP 621), src/ layout.
-# Install for development:   pip install -e .
-# With extras:               pip install -e ".[hf,curation,serve,dev]"
-# ----------------------------------------------------------------------------
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
+# PIP/PEP-503 naming: distribution name uses hyphens, import package uses underscores.
 name = "gemma-ft-json"
 version = "0.1.0"
-description = "Modular, offline fine-tuning of Gemma 3 270M as a document/table image -> JSON extractor (no Hugging Face downloads)."
+description = "Image-to-JSON fine-tuning of Gemma 3 270M via a from-scratch table-biased vision encoder, RMS-calibrated projector, and LoRA (fully offline, MPS-first)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
 authors = [{ name = "Navneet Singh" }]
-keywords = ["gemma", "vlm", "ocr", "table-extraction", "fine-tuning", "mps", "offline"]
-
 dependencies = [
-    "torch>=2.2",
-    "numpy>=1.24",
-    "pyyaml>=6.0",
-    "pillow>=10.0",
-    "tqdm>=4.66",
-    "matplotlib>=3.7",
+  "torch>=2.3",
+  "transformers>=4.50",   # used ONLY to load LOCAL weights (offline mode enforced in code)
+  "pyyaml>=6.0",
+  "numpy>=1.26",
+  "pillow>=10.0",
+  "matplotlib>=3.8",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
-curation = ["pymupdf>=1.24", "pytesseract>=0.3.10"]  # PDF/scan grounding (optional)
-hf = ["transformers>=4.49", "safetensors>=0.4"]      # LOCAL offline loading only
-serve = ["fastapi>=0.110", "uvicorn>=0.29"]           # deployment
-dev = ["pytest>=8.0", "nbformat>=5.9", "ipykernel>=6.29"]
-
-[project.scripts]
-gemma-ft-train = "gemma_ft_json.scripts_entry:train_cli"
-gemma-ft-verify-offline = "gemma_ft_json.scripts_entry:verify_offline_cli"
+dev = ["jupyter", "ipykernel", "pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-gemma_ft_json = ["py.typed"]

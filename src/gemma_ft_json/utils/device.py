@@ -1,32 +1,45 @@
-"""Device selection. Priority MPS (Apple Silicon) > CUDA > CPU, matching M4."""
+"""Device + offline-mode helpers (MPS-first, per project requirement)."""
 from __future__ import annotations
+
+import os
+
 import torch
 
 
-def get_device(preference: str = "auto") -> torch.device:
-    """Return a torch.device honoring an explicit preference or auto-selecting."""
-    pref = (preference or "auto").lower()
+def enforce_offline() -> None:
+    """HARD guarantee: no Hugging Face Hub traffic, ever.
 
-    def _mps_ok() -> bool:
-        # is_built() guards wheels compiled without MPS support.
-        return torch.backends.mps.is_available() and torch.backends.mps.is_built()
+    These env vars make `transformers` refuse any network call; loading is
+    only possible from a *local* directory. Called at import time by the
+    model loader, before transformers is imported.
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-    if pref == "mps":
-        return torch.device("mps") if _mps_ok() else torch.device("cpu")
-    if pref == "cuda":
-        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    if pref == "cpu":
-        return torch.device("cpu")
-    if _mps_ok():
+
+def resolve_device(preferred: str = "auto", mps_fallback_env: bool = True) -> torch.device:
+    """Pick the compute device. On a Mac M4 this resolves to MPS.
+
+    `PYTORCH_ENABLE_MPS_FALLBACK=1` lets the few ops MPS does not implement
+    silently fall back to CPU instead of crashing mid-epoch.
+    """
+    if mps_fallback_env:
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+    if preferred != "auto":
+        return torch.device(preferred)
+    if torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-def describe_device(device: torch.device) -> str:
-    if device.type == "mps":
-        return "Apple MPS (Metal) — unified memory"
-    if device.type == "cuda":
-        return f"CUDA: {torch.cuda.get_device_name(device.index or 0)}"
-    return "CPU"
+def resolve_dtype(name: str) -> torch.dtype:
+    """Map config string -> torch dtype. fp16 is intentionally not offered:
+    MPS has no GradScaler, so fp16 training NaNs almost immediately."""
+    table = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+    if name not in table:
+        raise ValueError(f"dtype must be one of {list(table)}, got {name!r}")
+    return table[name]

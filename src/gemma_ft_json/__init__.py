@@ -1,30 +1,18 @@
-"""gemma_ft_json
-================
-Modular, offline, MPS-friendly fine-tuning of **Gemma 3 270M** (text-only) as the
-decoder of a small Vision-Language Model that reads table/document images and
-emits **structured JSON**.
+"""gemma_ft_json — offline image-to-JSON fine-tuning of Gemma 3 270M.
 
-Design goals
-------------
-* Plug-and-play modules (encoder / projector / decoder / tokenizer / loss) so the
-  Gemma decoder fuses easily with other models.
-* Config-driven (YAML); no dataset path or hyper-parameter is hard-coded.
-* Runs end-to-end with **zero network access** via pure-PyTorch fallbacks, while
-  still supporting real Gemma/SigLIP weights loaded *locally*.
+Plug-and-play layout (each sub-package is independently importable):
 
-Hugging Face restriction
-------------------------
-This package NEVER downloads weights from the HF Hub. We force offline mode HERE,
-at first import, BEFORE `transformers`/`huggingface_hub` are imported anywhere —
-so any accidental Hub fetch raises locally instead of hitting the network.
+    gemma_ft_json.config     -> YAML config loading & validation
+    gemma_ft_json.utils      -> device/seed/logging/registry helpers
+    gemma_ft_json.data       -> synthetic table generator, Dataset, collator
+    gemma_ft_json.models     -> vision encoder, projector, LoRA, fused VLM
+    gemma_ft_json.training   -> trainer, losses, checkpointing
+    gemma_ft_json.inference  -> predictor with JSON guard
 """
-from __future__ import annotations
-
-import os as _os
-
-_os.environ.setdefault("HF_HUB_OFFLINE", "1")
-_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-_os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # unsupported MPS ops -> CPU
 
 __version__ = "0.1.0"
-__all__ = ["__version__"]
+
+from .exceptions import (  # noqa: F401
+    GemmaFTError, ConfigError, ModelLoadError,
+    ShapeError, NumericalError, DataError, CheckpointError,
+)
